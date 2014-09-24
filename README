@@ -1,0 +1,17 @@
+Example usage::
+
+    gst-launch spot user=<user> pass=<pass> spotifykeyfile=<keyfile> uri=spotify://spotify:track:6HFbq7cewJ7rPiffV0ciil ! autoaudiosink
+
+Alternatively, you can set the following environment variables to avoid passing user, pass and spotifykeyfile to the gst element::
+
+    SPOTIFY_USER=<user>
+    SPOTIFY_PASS=<pass>
+    SPOTIFY_APPKEY=<keyfile>
+
+Then::
+
+    gst-launch spot uri=spotify://spotify:track:6HFbq7cewJ7rPiffV0ciil ! autoaudiosink
+
+Also, since the plugin implements a URI handler, this works with `playbin2`::
+
+    gst-launch playbin2 uri=spotify://spotify:track:6HFbq7cewJ7rPiffV0ciil
