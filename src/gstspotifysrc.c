@@ -31,7 +31,6 @@
 #include <gst/gst.h>
 #include <gst/base/gstbasesrc.h>
 #include <libspotify/api.h>
-#include <libspotify/apiwrapper.h>
 
 #include <string.h>
 #include <unistd.h>
@@ -426,6 +425,7 @@ gst_spotify_src_stop (GstBaseSrc * bsrc)
 
   spotify_stop(priv->spotify_context);
   gst_spotify_src_flush_queued (spotifysrc);
+  usleep(100000); // FIXME: Hack to avoid race condition on clean-up following stop
   spotify_destroy(priv->spotify_context);
 
   priv->started = FALSE;
@@ -822,7 +822,7 @@ static void spotify_main_loop(GstSpotifySessionContext *context)
     GTimeVal t;
     int timeout;
 
-    if (spw_session_process_events(context->session, &timeout) == SP_ERROR_OK) {
+    if (sp_session_process_events(context->session, &timeout) == SP_ERROR_OK) {
       GST_DEBUG_OBJECT(g_spotifysrc, "process events next timeout = %d", timeout);
     } else {
     	timeout = 1000;
@@ -840,7 +840,7 @@ static void spotify_loop(void)
   if (!context->destroy)
   {
     int timeout;
-    spw_session_process_events(context->session, &timeout);
+    sp_session_process_events(context->session, &timeout);
     GST_DEBUG_OBJECT (g_spotifysrc, "process events next timeout = %d", timeout);
   }
 }
@@ -851,17 +851,22 @@ static gboolean spotify_login(GstSpotifySessionContext *context,
 {
   context->logged_in = FALSE;
   GST_DEBUG_OBJECT (g_spotifysrc, "attempting to login");
-  sp_error ret = spw_session_login(context->session, user, password,
-                                   FALSE, NULL);
+  sp_error ret = sp_session_login(context->session, user, password,
+                                  FALSE, NULL);
 
   if (ret == SP_ERROR_OK) {
-    while (!context->logged_in) {
+    guint cnt = 10;
+    while (!context->logged_in && cnt-- > 0) {
       spotify_loop();
-      usleep(10000);
+      usleep(100000);
     }
+
+    if (!context->logged_in)
+      goto loginfailed;
     return TRUE;
   }
 
+loginfailed:
   GST_DEBUG_OBJECT (g_spotifysrc, "unable to login - error = %d", ret);
   return FALSE;
 }
@@ -869,7 +874,7 @@ static gboolean spotify_login(GstSpotifySessionContext *context,
 static gboolean spotify_seek(GstSpotifySessionContext *context, int offset)
 {
   GST_DEBUG_OBJECT (g_spotifysrc, "attempting to seek - offset = %d", offset);
-  sp_error ret = spw_session_player_seek(context->session, offset);
+  sp_error ret = sp_session_player_seek(context->session, offset);
   if (ret != SP_ERROR_OK) {
     GST_DEBUG_OBJECT (g_spotifysrc, "unable to seek - error = %d", ret);
     return FALSE;
@@ -892,7 +897,7 @@ static gboolean spotify_play(GstSpotifySessionContext *context, const char *link
   {
     GST_DEBUG_OBJECT (g_spotifysrc, "could not find track for %s", link);
     sp_link_release(spl);
-	return FALSE;
+    return FALSE;
   }
 
   /* Increment ref counts */
@@ -901,13 +906,22 @@ static gboolean spotify_play(GstSpotifySessionContext *context, const char *link
 
   /* Busy wait for track to load */
   GST_DEBUG_OBJECT (g_spotifysrc, "waiting for track to load...");
-  while (!sp_track_is_loaded(spt)) {
+  guint cnt = 10;
+  while (!sp_track_is_loaded(spt) && cnt-- > 0) {
     spotify_loop();
-    usleep(10000);
+    usleep(100000);
   }
+
+  if (!sp_track_is_loaded(spt)) {
+    GST_DEBUG_OBJECT (g_spotifysrc, "track loading timed out");
+    sp_track_release(spt);
+    sp_link_release(spl);
+    return FALSE;
+  }
+
   GST_DEBUG_OBJECT (g_spotifysrc, "track is loaded");
 
-  sp_error ret = spw_session_player_load(context->session, spt);
+  sp_error ret = sp_session_player_load(context->session, spt);
   if (ret != SP_ERROR_OK) {
     GST_DEBUG_OBJECT (g_spotifysrc, "player could not load track - error = %d", ret);
     sp_track_release(spt);
@@ -918,7 +932,7 @@ static gboolean spotify_play(GstSpotifySessionContext *context, const char *link
   /* Update track duration */
   g_spotifysrc->priv->size = sp_track_duration(spt) * GST_MSECOND;
 
-  ret = spw_session_player_play(context->session, TRUE);
+  ret = sp_session_player_play(context->session, TRUE);
   if (ret != SP_ERROR_OK) {
     GST_DEBUG_OBJECT (g_spotifysrc, "player could not play - error = %d", ret);
     sp_track_release(spt);
@@ -932,13 +946,13 @@ static gboolean spotify_play(GstSpotifySessionContext *context, const char *link
 static gboolean spotify_stop(GstSpotifySessionContext *context)
 {
   GST_DEBUG_OBJECT (g_spotifysrc, "attempting to stop player");
-  sp_error ret = spw_session_player_play(context->session, FALSE);
+  sp_error ret = sp_session_player_play(context->session, FALSE);
   if (ret != SP_ERROR_OK) {
     GST_DEBUG_OBJECT (g_spotifysrc, "unable to stop player - error = %d", ret);
     return FALSE;
   }
 
-  ret = spw_session_player_unload(context->session);
+  ret = sp_session_player_unload(context->session);
   if (ret != SP_ERROR_OK) {
     GST_DEBUG_OBJECT (g_spotifysrc, "unable to unload player - error = %d", ret);
     return FALSE;
@@ -1114,7 +1128,7 @@ static gboolean spotify_create(char *appkey_file)
   config.compress_playlists = FALSE;
   config.dont_save_metadata_for_playlists = FALSE;
 
-  sp_error ret = spw_session_create(&config, &context->session);
+  sp_error ret = sp_session_create(&config, &context->session);
   if (ret == SP_ERROR_OK)
   {
     GError *err;
@@ -1123,7 +1137,7 @@ static gboolean spotify_create(char *appkey_file)
     if (context->thread == NULL) {
   	   GST_DEBUG_OBJECT (g_spotifysrc, "g_thread_create failed: %s!", err->message );
        g_error_free (err);
-  	   spw_session_release(context->session);
+  	   sp_session_release(context->session);
        goto fail;
     }
 
@@ -1145,7 +1159,7 @@ static gboolean spotify_destroy(GstSpotifySessionContext *context)
   context->destroy = TRUE;
   g_cond_signal(context->cond);
   g_thread_join(context->thread);
-  sp_error ret = spw_session_release(context->session);
+  sp_error ret = sp_session_release(context->session);
   g_mutex_free(context->mutex);
   g_cond_free(context->cond);
   g_free(context);
