@@ -286,6 +286,7 @@ gst_spotify_src_finalize (GObject * obj)
   GstSpotifySrc *spotifysrc = GST_SPOTIFY_SRC_CAST (obj);
   GstSpotifySrcPrivate *priv = spotifysrc->priv;
 
+  spotify_destroy(priv->spotify_context);
   g_free (priv->uri);
   g_free (priv->appkey_file);
   g_free (priv->user);
@@ -401,7 +402,7 @@ gst_spotify_src_start (GstBaseSrc * bsrc)
       !spotify_play(priv->spotify_context, gst_uri_get_location(priv->uri)))
   {
     g_mutex_unlock (priv->mutex);
-	return FALSE;
+    return FALSE;
   }
 
   priv->started = TRUE;
@@ -1090,6 +1091,12 @@ static gboolean spotify_create(char *appkey_file)
   GstSpotifySessionContext *context;
   sp_session_config config;
 
+  if (g_spotifysrc->priv->spotify_context != NULL)
+  {
+    GST_DEBUG_OBJECT (g_spotifysrc, "spotify session already created");
+    return TRUE;
+  }
+
   static uint8_t appkey[321];
   static const size_t appkey_size = sizeof(appkey);
   FILE *keyfile;
@@ -1155,6 +1162,12 @@ fail:
 
 static gboolean spotify_destroy(GstSpotifySessionContext *context)
 {
+  if (context == NULL)
+  {
+    GST_DEBUG_OBJECT (g_spotifysrc, "spotify session already destroyed");
+    return TRUE;
+  }
+
   GST_DEBUG_OBJECT (g_spotifysrc, "now destroying spotify session");
   context->destroy = TRUE;
   g_cond_signal(context->cond);
@@ -1163,6 +1176,7 @@ static gboolean spotify_destroy(GstSpotifySessionContext *context)
   g_mutex_free(context->mutex);
   g_cond_free(context->cond);
   g_free(context);
+  g_spotifysrc->priv->spotify_context = NULL;
   if (ret != SP_ERROR_OK) {
     GST_DEBUG_OBJECT (g_spotifysrc, "failed to release session - error = %d", ret);
     return FALSE;
