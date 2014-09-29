@@ -1135,16 +1135,18 @@ static gboolean spotify_create(char *appkey_file)
   config.compress_playlists = FALSE;
   config.dont_save_metadata_for_playlists = FALSE;
 
+  /* Once we create the session, we may get callbacks */
+  g_spotifysrc->priv->spotify_context = context;
+
   sp_error ret = sp_session_create(&config, &context->session);
   if (ret == SP_ERROR_OK)
   {
     GError *err;
-    g_spotifysrc->priv->spotify_context = context;
     context->thread = g_thread_create ((GThreadFunc)spotify_main_loop, context, TRUE, &err);
     if (context->thread == NULL) {
-  	   GST_DEBUG_OBJECT (g_spotifysrc, "g_thread_create failed: %s!", err->message );
+       GST_DEBUG_OBJECT (g_spotifysrc, "g_thread_create failed: %s!", err->message );
        g_error_free (err);
-  	   sp_session_release(context->session);
+       sp_session_release(context->session);
        goto fail;
     }
 
@@ -1154,6 +1156,7 @@ static gboolean spotify_create(char *appkey_file)
   GST_DEBUG_OBJECT (g_spotifysrc, "unable to create session - error = %d", ret);
 
 fail:
+  g_spotifysrc->priv->spotify_context = NULL;
   g_mutex_free(context->mutex);
   g_cond_free(context->cond);
   g_free(context);
