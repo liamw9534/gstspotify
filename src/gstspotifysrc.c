@@ -819,6 +819,7 @@ gst_spotify_src_uri_handler_init (gpointer g_iface, gpointer iface_data)
 
 static void spotify_main_loop(GstSpotifySessionContext *context)
 {
+  g_mutex_lock(context->mutex);
   while (!context->destroy) {
     GTimeVal t;
     int timeout;
@@ -1172,8 +1173,10 @@ static gboolean spotify_destroy(GstSpotifySessionContext *context)
   }
 
   GST_DEBUG_OBJECT (g_spotifysrc, "now destroying spotify session");
+  g_mutex_lock(context->mutex);
   context->destroy = TRUE;
   g_cond_signal(context->cond);
+  g_mutex_unlock(context->mutex);
   g_thread_join(context->thread);
   sp_error ret = sp_session_release(context->session);
   g_mutex_free(context->mutex);
