@@ -426,7 +426,6 @@ gst_spotify_src_stop (GstBaseSrc * bsrc)
 
   spotify_stop(priv->spotify_context);
   gst_spotify_src_flush_queued (spotifysrc);
-  usleep(100000); // FIXME: Hack to avoid race condition on clean-up following stop
   spotify_destroy(priv->spotify_context);
 
   priv->started = FALSE;
@@ -506,16 +505,29 @@ gst_spotify_src_do_seek (GstBaseSrc * src, GstSegment * segment)
     return TRUE;
   }
 
+  /* Avoid seeking again if we are already at the desired position */
+  if (priv->buffer_timestamp == desired_position)
+  {
+    GST_DEBUG_OBJECT (spotifysrc, "already at position %" G_GINT64_FORMAT,
+                      desired_position);
+    return TRUE;
+  }
+
   GST_DEBUG_OBJECT (spotifysrc, "seeking to %" G_GINT64_FORMAT ", format %s",
       desired_position, gst_format_get_name (segment->format));
 
   res = spotify_seek(priv->spotify_context, (desired_position / GST_MSECOND));
 
   if (res) {
+    g_mutex_lock (priv->mutex);
     GST_DEBUG_OBJECT (spotifysrc, "flushing queue");
     gst_spotify_src_flush_queued (spotifysrc);
     priv->is_eos = FALSE;
     priv->buffer_timestamp = desired_position;
+    GST_DEBUG_OBJECT (spotifysrc, "Waiting for seek to arrive...");
+    g_cond_wait (priv->cond, priv->mutex);
+    GST_DEBUG_OBJECT (spotifysrc, "Seek has arrived...");
+    g_mutex_unlock (priv->mutex);
   } else {
     GST_WARNING_OBJECT (spotifysrc, "seek failed");
   }
@@ -571,9 +583,6 @@ gst_spotify_src_create (GstBaseSrc * bsrc, guint64 offset, guint size,
         gst_buffer_set_caps (*buf, caps);
       }
 
-      /* signal that we removed an item */
-      g_cond_broadcast (priv->cond);
-
       ret = GST_FLOW_OK;
       break;
     } else {
@@ -598,6 +607,7 @@ gst_spotify_src_create (GstBaseSrc * bsrc, guint64 offset, guint size,
       goto eos;
 
     /* nothing to return, wait a while for new data or flushing. */
+    GST_DEBUG_OBJECT (spotifysrc, "Waiting for data...");
     priv->stutter++;
     g_cond_wait (priv->cond, priv->mutex);
   }
@@ -626,10 +636,10 @@ eos:
   }
 }
 
-static gboolean gst_spotify_src_alloc_and_queue(GstSpotifySrc * spotifysrc,
-                                                guint num_frames,
-                                                const void * data_frames,
-                                                guint data_size)
+static guint gst_spotify_src_alloc_and_queue(GstSpotifySrc * spotifysrc,
+                                             guint num_frames,
+                                             const void * data_frames,
+                                             guint data_size)
 {
   GstSpotifySrcPrivate *priv;
 
@@ -649,16 +659,16 @@ static gboolean gst_spotify_src_alloc_and_queue(GstSpotifySrc * spotifysrc,
         "queue filled (%" G_GUINT64_FORMAT " >= %" G_GUINT64_FORMAT ")",
         priv->queued_bytes, priv->max_bytes);
     g_mutex_unlock (priv->mutex);
-    return FALSE;
+    return 0;
   }
 
   /* Allocate buffer and copy spotify data into buffer */
   GstBuffer *buffer = gst_buffer_new_and_alloc (data_size);
   if (!buffer)
   {
-	GST_DEBUG_OBJECT (spotifysrc, "gst_buffer allocation failed");
-    g_mutex_unlock (priv->mutex);
-	return FALSE;
+      GST_DEBUG_OBJECT (spotifysrc, "gst_buffer allocation failed");
+      g_mutex_unlock (priv->mutex);
+      return 0;
   }
 
   memcpy (GST_BUFFER_DATA (buffer), (guint8 *)data_frames, data_size);
@@ -677,20 +687,20 @@ static gboolean gst_spotify_src_alloc_and_queue(GstSpotifySrc * spotifysrc,
   g_cond_broadcast (priv->cond);
   g_mutex_unlock (priv->mutex);
 
-  return TRUE;
+  return num_frames;
 
   /* ERRORS */
 flushing:
   {
     GST_DEBUG_OBJECT (spotifysrc, "refuse music data, we are flushing");
     g_mutex_unlock (priv->mutex);
-    return FALSE;
+    return num_frames;
   }
 eos:
   {
     GST_DEBUG_OBJECT (spotifysrc, "refuse music data, we are EOS");
     g_mutex_unlock (priv->mutex);
-    return FALSE;
+    return num_frames;
   }
 }
 
@@ -834,17 +844,15 @@ static void spotify_main_loop(GstSpotifySessionContext *context)
     g_time_val_add(&t, (timeout * 1000));
     g_cond_timed_wait(context->cond, context->mutex, &t);
   }
+  g_mutex_unlock(context->mutex);
 }
 
 static void spotify_loop(void)
 {
   GstSpotifySessionContext *context = SPOTIFY_CONTEXT(g_spotifysrc);
-  if (!context->destroy)
-  {
-    int timeout;
-    sp_session_process_events(context->session, &timeout);
-    GST_DEBUG_OBJECT (g_spotifysrc, "process events next timeout = %d", timeout);
-  }
+  int timeout;
+  sp_session_process_events(context->session, &timeout);
+  GST_DEBUG_OBJECT (g_spotifysrc, "process events next timeout = %d", timeout);
 }
 
 static gboolean spotify_login(GstSpotifySessionContext *context,
@@ -853,6 +861,7 @@ static gboolean spotify_login(GstSpotifySessionContext *context,
 {
   context->logged_in = FALSE;
   GST_DEBUG_OBJECT (g_spotifysrc, "attempting to login");
+  g_mutex_lock(context->mutex);
   sp_error ret = sp_session_login(context->session, user, password,
                                   FALSE, NULL);
 
@@ -865,32 +874,40 @@ static gboolean spotify_login(GstSpotifySessionContext *context,
 
     if (!context->logged_in)
       goto loginfailed;
+    g_mutex_unlock(context->mutex);
     return TRUE;
   }
 
 loginfailed:
   GST_DEBUG_OBJECT (g_spotifysrc, "unable to login - error = %d", ret);
+  g_mutex_unlock(context->mutex);
   return FALSE;
 }
 
 static gboolean spotify_seek(GstSpotifySessionContext *context, int offset)
 {
   GST_DEBUG_OBJECT (g_spotifysrc, "attempting to seek - offset = %d", offset);
+  g_mutex_lock(context->mutex);
   sp_error ret = sp_session_player_seek(context->session, offset);
   if (ret != SP_ERROR_OK) {
     GST_DEBUG_OBJECT (g_spotifysrc, "unable to seek - error = %d", ret);
+    g_mutex_unlock(context->mutex);
     return FALSE;
   }
+  g_mutex_unlock(context->mutex);
   return TRUE;
 }
 
 static gboolean spotify_play(GstSpotifySessionContext *context, const char *link)
 {
   GST_DEBUG_OBJECT (g_spotifysrc, "attempting to load link = %s", link);
+
+  g_mutex_lock(context->mutex);
   sp_link *spl = sp_link_create_from_string(link);
   if (!spl)
   {
-	GST_DEBUG_OBJECT (g_spotifysrc, "could not create link for %s", link);
+    GST_DEBUG_OBJECT (g_spotifysrc, "could not create link for %s", link);
+    g_mutex_unlock(context->mutex);
     return FALSE;
   }
 
@@ -899,6 +916,7 @@ static gboolean spotify_play(GstSpotifySessionContext *context, const char *link
   {
     GST_DEBUG_OBJECT (g_spotifysrc, "could not find track for %s", link);
     sp_link_release(spl);
+    g_mutex_unlock(context->mutex);
     return FALSE;
   }
 
@@ -908,7 +926,7 @@ static gboolean spotify_play(GstSpotifySessionContext *context, const char *link
 
   /* Busy wait for track to load */
   GST_DEBUG_OBJECT (g_spotifysrc, "waiting for track to load...");
-  guint cnt = 10;
+  guint cnt = 20;
   while (!sp_track_is_loaded(spt) && cnt-- > 0) {
     spotify_loop();
     usleep(100000);
@@ -918,6 +936,7 @@ static gboolean spotify_play(GstSpotifySessionContext *context, const char *link
     GST_DEBUG_OBJECT (g_spotifysrc, "track loading timed out");
     sp_track_release(spt);
     sp_link_release(spl);
+    g_mutex_unlock(context->mutex);
     return FALSE;
   }
 
@@ -928,6 +947,7 @@ static gboolean spotify_play(GstSpotifySessionContext *context, const char *link
     GST_DEBUG_OBJECT (g_spotifysrc, "player could not load track - error = %d", ret);
     sp_track_release(spt);
     sp_link_release(spl);
+    g_mutex_unlock(context->mutex);
     return FALSE;
   }
 
@@ -939,30 +959,36 @@ static gboolean spotify_play(GstSpotifySessionContext *context, const char *link
     GST_DEBUG_OBJECT (g_spotifysrc, "player could not play - error = %d", ret);
     sp_track_release(spt);
     sp_link_release(spl);
+    g_mutex_unlock(context->mutex);
     return FALSE;
   }
 
+  g_mutex_unlock(context->mutex);
   return TRUE;
 }
 
 static gboolean spotify_stop(GstSpotifySessionContext *context)
 {
   GST_DEBUG_OBJECT (g_spotifysrc, "attempting to stop player");
+  g_mutex_lock(context->mutex);
   sp_error ret = sp_session_player_play(context->session, FALSE);
   if (ret != SP_ERROR_OK) {
     GST_DEBUG_OBJECT (g_spotifysrc, "unable to stop player - error = %d", ret);
+    g_mutex_unlock(context->mutex);
     return FALSE;
   }
 
   ret = sp_session_player_unload(context->session);
   if (ret != SP_ERROR_OK) {
     GST_DEBUG_OBJECT (g_spotifysrc, "unable to unload player - error = %d", ret);
+    g_mutex_unlock(context->mutex);
     return FALSE;
   }
 
   /* Reset total track size */
   g_spotifysrc->priv->size = -1;
 
+  g_mutex_unlock(context->mutex);
   return TRUE;
 }
 
@@ -1004,8 +1030,7 @@ static void spotify_notify_main_thread_cb(sp_session *session)
 {
   GstSpotifySessionContext *context = SPOTIFY_CONTEXT(g_spotifysrc);
   GST_DEBUG_OBJECT (g_spotifysrc, "notify main thread");
-  if (!context->destroy)
-    g_cond_signal(context->cond);
+  g_cond_signal(context->cond);
 }
 
 static int spotify_music_delivery_cb(sp_session *session,
@@ -1021,9 +1046,7 @@ static int spotify_music_delivery_cb(sp_session *session,
     return 0; /* Seeking */
   }
 
-  if (gst_spotify_src_alloc_and_queue(g_spotifysrc, num_frames, frames, bufsize))
-    return num_frames;
-  return 0;
+  return gst_spotify_src_alloc_and_queue(g_spotifysrc, num_frames, frames, bufsize);
 }
 
 static void spotify_play_token_lost_cb(sp_session *session)
@@ -1056,7 +1079,7 @@ static void spotify_get_audio_buffer_stats_cb(sp_session *session, sp_audio_buff
   stats->stutter = g_spotifysrc->priv->stutter;
   stats->samples = g_spotifysrc->priv->queued_bytes / (2*sizeof(gint16));
   GST_DEBUG_OBJECT (g_spotifysrc, "indicating audio buffer stats - stutter = %d samples = %d",
-		            stats->stutter, stats->samples);
+                    stats->stutter, stats->samples);
 }
 
 static void spotify_userinfo_updated_cb(sp_session *session)
@@ -1078,9 +1101,9 @@ static gboolean spotify_create(char *appkey_file)
     &spotify_log_message_cb,
     &spotify_end_of_track_cb,
     &spotify_streaming_error_cb,
-	&spotify_userinfo_updated_cb,
-	NULL,
-	NULL,
+    &spotify_userinfo_updated_cb,
+    NULL,
+    NULL,
     &spotify_get_audio_buffer_stats_cb,
     NULL,
     NULL,
