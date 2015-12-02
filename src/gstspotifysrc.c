@@ -95,7 +95,8 @@ enum
   PROP_LAST
 };
 
-/* Spotify library does not provide user data with callbacks, so we
+/*
+ * Spotify library does not provide user data with callbacks, so we
  * have to store our context globally.
  */
 static GstSpotifySrc *g_spotifysrc = NULL;
@@ -168,20 +169,20 @@ gst_spotify_src_class_init (GstSpotifySrcClass * klass)
   gobject_class->get_property = gst_spotify_src_get_property;
 
   g_object_class_install_property (gobject_class, PROP_USER,
-      g_param_spec_string ("user", "Username", "Username for premium spotify account",
+      g_param_spec_string ("user", "Username", "Username for premium Spotify account",
           DEFAULT_PROP_USER, G_PARAM_READWRITE));
 
   g_object_class_install_property (gobject_class, PROP_PASS,
-      g_param_spec_string ("pass", "Password", "Password for premium spotify account",
-	  DEFAULT_PROP_PASS, G_PARAM_READWRITE));
+      g_param_spec_string ("pass", "Password", "Password for premium Spotify account",
+	      DEFAULT_PROP_PASS, G_PARAM_READWRITE));
 
   g_object_class_install_property (gobject_class, PROP_URI,
-      g_param_spec_string ("uri", "URI", "A URI", DEFAULT_PROP_URI,
-          G_PARAM_READWRITE));
+      g_param_spec_string ("uri", "URI", "A Spotify track URI",
+          DEFAULT_PROP_URI, G_PARAM_READWRITE));
 
   g_object_class_install_property (gobject_class, PROP_APPKEY_FILE,
       g_param_spec_string ("spotifykeyfile", "Spotify app key File", "Path to spotify key file",
-        DEFAULT_PROP_APPKEY_FILE, G_PARAM_READWRITE));
+          DEFAULT_PROP_APPKEY_FILE, G_PARAM_READWRITE));
 
   basesrc_class->create = gst_spotify_src_create;
   basesrc_class->start = gst_spotify_src_start;
@@ -197,13 +198,14 @@ gst_spotify_src_class_init (GstSpotifySrcClass * klass)
   gst_element_class_add_pad_template (element_class,
     gst_static_pad_template_get (&gst_spotify_src_template));
 
-  gst_element_class_set_details_simple (element_class, "Spotify audio source",
+  gst_element_class_set_details_simple (
+    element_class,
+    "Spotify audio source",
     "Generic/Source",
     "Feed spotify hosted music to a pipeline",
     "Liam Wickins <liamw9534@gmail.com>");
 
-  GST_DEBUG_CATEGORY_INIT (
-    spotify_src_debug, "spotify", 0, "spotifysrc element");
+  GST_DEBUG_CATEGORY_INIT (spotify_src_debug, "spotify", 0, "spotifysrc element");
 
   g_type_class_add_private (klass, sizeof (GstSpotifySrcPrivate));
 }
@@ -266,10 +268,10 @@ gst_spotify_src_finalize (GObject * obj)
   GstSpotifySrcPrivate *priv = spotifysrc->priv;
 
   spotify_destroy(priv->spotify_context);
-  g_free (priv->uri);
-  g_free (priv->appkey_file);
   g_free (priv->user);
   g_free (priv->pass);
+  g_free (priv->appkey_file);
+  g_free (priv->uri);
   g_queue_free (priv->queue);
 
   G_OBJECT_CLASS (parent_class)->finalize (obj);
@@ -365,6 +367,7 @@ gst_spotify_src_start (GstBaseSrc * bsrc)
 {
   GstSpotifySrc *spotifysrc = GST_SPOTIFY_SRC_CAST (bsrc);
   GstSpotifySrcPrivate *priv = spotifysrc->priv;
+  gboolean has_created, has_logged_in, has_started;
 
   g_mutex_lock(&priv->mutex);
   GST_DEBUG_OBJECT (spotifysrc, "starting");
@@ -373,11 +376,15 @@ gst_spotify_src_start (GstBaseSrc * bsrc)
   priv->stutter = 0;
   priv->buffer_timestamp = 0;
 
-  /* Create session */
-  if (!spotify_create(priv->appkey_file) ||
-      !spotify_login(priv->spotify_context, priv->user, priv->pass) ||
-      !spotify_play(priv->spotify_context, gst_uri_get_location(priv->uri)))
+  has_created = has_logged_in = has_started = FALSE;
+  if (!(has_created = spotify_create(priv->appkey_file)) ||
+      !(has_logged_in = spotify_login(priv->spotify_context, priv->user, priv->pass)) ||
+      !(has_started = spotify_play(priv->spotify_context, gst_uri_get_location(priv->uri))))
   {
+    if (!has_created) GST_DEBUG_OBJECT(spotifysrc, "Could not instantiate Spotify");
+    if (!has_logged_in) GST_DEBUG_OBJECT(spotifysrc, "Could not log in to Spotify");
+    if (!has_started) GST_DEBUG_OBJECT(spotifysrc, "Could not play track URI");
+
     g_mutex_unlock(&priv->mutex);
     return FALSE;
   }
@@ -845,7 +852,7 @@ static gboolean spotify_login(GstSpotifySessionContext *context,
     guint cnt = 10;
     while (!context->logged_in && cnt-- > 0) {
       spotify_loop();
-      usleep(100000);
+      usleep(200000); // 200000 * 10 = 2 seconds
     }
 
     if (!context->logged_in)
@@ -905,7 +912,7 @@ static gboolean spotify_play(GstSpotifySessionContext *context, const char *link
   guint cnt = 20;
   while (!sp_track_is_loaded(spt) && cnt-- > 0) {
     spotify_loop();
-    usleep(100000);
+    usleep(200000); // 200000 * 20 = 4 seconds
   }
 
   if (!sp_track_is_loaded(spt)) {
@@ -976,6 +983,9 @@ static void spotify_logged_in_cb(sp_session *session, sp_error error)
     context->logged_in = TRUE;
   else
     context->logged_in = FALSE;
+
+    // This is absolutely necessary here, see: http://goo.gl/78xPQh
+    sp_session_playlistcontainer(session);
 }
 
 static void spotify_logged_out_cb(sp_session *session)
