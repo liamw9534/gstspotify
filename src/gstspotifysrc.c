@@ -24,6 +24,7 @@
 #endif
 
 #include <gst/gst.h>
+#include <gst/audio/audio.h>
 #include <gst/base/gstbasesrc.h>
 #include <libspotify/api.h>
 
@@ -105,12 +106,15 @@ static GstStaticPadTemplate gst_spotify_src_template =
 GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("audio/x-raw-int, "
+    GST_STATIC_CAPS ("audio/x-raw, "
+            // This line will most probably break source hilighting :/
+            "format = (string) " GST_AUDIO_NE(S16) ", "
             "endianness = (int) { 1234 }, "
             "signed = (boolean) { TRUE }, "
             "width = (int) 16, "
             "depth = (int) 16, "
-            "rate = (int) 44100, channels = (int) 2; ")
+            "rate = (int) 44100, "
+            "channels = (int) 2")
     );
 
 static void gst_spotify_src_uri_handler_init (gpointer g_iface,
@@ -132,7 +136,6 @@ static gboolean gst_spotify_src_unlock (GstBaseSrc * bsrc);
 static gboolean gst_spotify_src_unlock_stop (GstBaseSrc * bsrc);
 static gboolean gst_spotify_src_do_seek (GstBaseSrc * src, GstSegment * segment);
 static gboolean gst_spotify_src_is_seekable (GstBaseSrc * src);
-static gboolean gst_spotify_src_check_get_range (GstBaseSrc * src);
 static gboolean gst_spotify_src_do_get_size (GstBaseSrc * src, guint64 * size);
 static gboolean gst_spotify_src_query (GstBaseSrc * src, GstQuery * query);
 static gboolean
@@ -191,19 +194,18 @@ gst_spotify_src_class_init (GstSpotifySrcClass * klass)
   basesrc_class->unlock_stop = gst_spotify_src_unlock_stop;
   basesrc_class->do_seek = gst_spotify_src_do_seek;
   basesrc_class->is_seekable = gst_spotify_src_is_seekable;
-  basesrc_class->check_get_range = gst_spotify_src_check_get_range;
   basesrc_class->get_size = gst_spotify_src_do_get_size;
   basesrc_class->query = gst_spotify_src_query;
 
   gst_element_class_add_pad_template (element_class,
     gst_static_pad_template_get (&gst_spotify_src_template));
 
-  gst_element_class_set_details_simple (
+  gst_element_class_set_metadata (
     element_class,
     "Spotify audio source",
-    "Generic/Source",
-    "Feed spotify hosted music to a pipeline",
-    "Liam Wickins <liamw9534@gmail.com>");
+    "Source/Audio/Network/Protocol",
+    "Feed Spotify hosted music to a pipeline",
+    "Liam Wickins <liam9534@gmail.com>");
 
   GST_DEBUG_CATEGORY_INIT (spotify_src_debug, "spotify", 0, "spotifysrc element");
 
@@ -425,12 +427,6 @@ gst_spotify_src_is_seekable (GstBaseSrc * src)
 }
 
 static gboolean
-gst_spotify_src_check_get_range (GstBaseSrc * src)
-{
-  return FALSE;
-}
-
-static gboolean
 gst_spotify_src_do_get_size (GstBaseSrc * src, guint64 * size)
 {
   GstSpotifySrc *spotifysrc = GST_SPOTIFY_SRC_CAST (src);
@@ -461,6 +457,22 @@ gst_spotify_src_query (GstBaseSrc * src, GstQuery * query)
       gst_query_set_latency (query, live, min, max);
       break;
     }
+    case GST_QUERY_SCHEDULING:
+    {
+      gst_query_add_scheduling_mode (query, GST_PAD_MODE_PUSH);
+      res = TRUE;
+      break;
+    }
+    case GST_QUERY_CAPS:
+    {
+      GstCaps *caps;
+
+      caps = gst_static_pad_template_get_caps (&gst_spotify_src_template);
+      gst_query_set_caps_result (query, caps);
+      gst_caps_unref (caps);
+      res = TRUE;
+      break;
+    }
     default:
       res = GST_BASE_SRC_CLASS (parent_class)->query (src, query);
       break;
@@ -478,7 +490,7 @@ gst_spotify_src_do_seek (GstBaseSrc * src, GstSegment * segment)
   gint64 desired_position;
   gboolean res = FALSE;
 
-  desired_position = segment->last_stop;
+  desired_position = segment->position;
 
   /* This is to workaround a bug in spotify since we can't allow
    * an initial seek to position zero until the decoder has sent
@@ -535,12 +547,11 @@ gst_spotify_src_create (GstBaseSrc * bsrc, guint64 offset, guint size,
     GST_DEBUG_OBJECT (spotifysrc,
         "Size changed from %" G_GINT64_FORMAT " to %" G_GINT64_FORMAT,
         bsrc->segment.duration, priv->size);
-    gst_segment_set_duration (&bsrc->segment, GST_FORMAT_TIME, priv->size);
+    bsrc->segment.duration = priv->size;
     GST_OBJECT_UNLOCK (spotifysrc);
 
     gst_element_post_message (GST_ELEMENT (spotifysrc),
-        gst_message_new_duration (GST_OBJECT (spotifysrc), GST_FORMAT_TIME,
-            priv->size));
+        gst_message_new_duration_changed (GST_OBJECT (spotifysrc)));
   } else {
     GST_OBJECT_UNLOCK (spotifysrc);
   }
@@ -556,16 +567,11 @@ gst_spotify_src_create (GstBaseSrc * bsrc, guint64 offset, guint size,
       guint buf_size;
 
       *buf = g_queue_pop_head (priv->queue);
-      buf_size = GST_BUFFER_SIZE (*buf);
+      buf_size = gst_buffer_get_size (*buf);
 
       GST_DEBUG_OBJECT (spotifysrc, "we have buffer %p of size %u", *buf, buf_size);
 
       priv->queued_bytes -= buf_size;
-
-      if (caps) {
-        *buf = gst_buffer_make_metadata_writable (*buf);
-        gst_buffer_set_caps (*buf, caps);
-      }
 
       ret = GST_FLOW_OK;
       break;
@@ -608,7 +614,7 @@ flushing:
     g_mutex_unlock(&priv->mutex);
     if (caps)
       gst_caps_unref (caps);
-    return GST_FLOW_WRONG_STATE;
+    return GST_FLOW_FLUSHING;
   }
 eos:
   {
@@ -616,7 +622,7 @@ eos:
     g_mutex_unlock(&priv->mutex);
     if (caps)
       gst_caps_unref (caps);
-    return GST_FLOW_UNEXPECTED;
+    return GST_FLOW_EOS;
   }
 }
 
@@ -647,7 +653,7 @@ static guint gst_spotify_src_alloc_and_queue(GstSpotifySrc * spotifysrc,
   }
 
   /* Allocate buffer and copy spotify data into buffer */
-  GstBuffer *buffer = gst_buffer_new_and_alloc (data_size);
+  GstBuffer *buffer = gst_buffer_new_allocate (NULL, data_size, NULL);
   if (!buffer)
   {
       GST_DEBUG_OBJECT (spotifysrc, "gst_buffer allocation failed");
@@ -655,7 +661,11 @@ static guint gst_spotify_src_alloc_and_queue(GstSpotifySrc * spotifysrc,
       return 0;
   }
 
-  memcpy (GST_BUFFER_DATA (buffer), (guint8 *)data_frames, data_size);
+  GstMapInfo info;
+  gst_buffer_map(buffer, &info, GST_MAP_WRITE);
+  memcpy (info.data, (guint8 *)data_frames, info.size);
+  gst_buffer_unmap(buffer, &info);
+
   GstClockTime duration = gst_util_uint64_scale(num_frames, GST_SECOND, 44100);
   GST_BUFFER_DURATION(buffer) = duration;
   GST_BUFFER_TIMESTAMP(buffer) = priv->buffer_timestamp;
@@ -663,7 +673,7 @@ static guint gst_spotify_src_alloc_and_queue(GstSpotifySrc * spotifysrc,
   GST_DEBUG_OBJECT (spotifysrc, "queueing buffer %p", buffer);
   gst_buffer_ref (buffer);
   g_queue_push_tail (priv->queue, buffer);
-  priv->queued_bytes += GST_BUFFER_SIZE (buffer);
+  priv->queued_bytes += gst_buffer_get_size (buffer);
   GST_DEBUG_OBJECT (spotifysrc,
                     "queued bytes = %" G_GUINT64_FORMAT " ts = %" G_GUINT64_FORMAT,
                     priv->queued_bytes, priv->buffer_timestamp);
@@ -754,7 +764,6 @@ gst_spotify_src_set_uri (GstSpotifySrc *spotifysrc, const gchar *uri)
   spotifysrc->priv->uri = g_strdup(uri);
 
   g_object_notify (G_OBJECT (spotifysrc), "uri");
-  gst_uri_handler_new_uri (GST_URI_HANDLER (spotifysrc), spotifysrc->priv->uri);
 
   return TRUE;
 
@@ -768,20 +777,20 @@ wrong_location:
 }
 
 static GstURIType
-gst_spotify_src_uri_get_type (void)
+gst_spotify_src_uri_get_type (GType type)
 {
   return GST_URI_SRC;
 }
 
-static gchar **
-gst_spotify_src_uri_get_protocols (void)
+static const gchar * const *
+gst_spotify_src_uri_get_protocols (GType type)
 {
-  static gchar *protocols[] = { (char *) "spotify", NULL };
+  static const gchar * const protocols[] = { (const char *) "spotify", NULL };
 
   return protocols;
 }
 
-static const gchar *
+static gchar *
 gst_spotify_src_uri_get_uri (GstURIHandler * handler)
 {
   GstSpotifySrc *spotifysrc = GST_SPOTIFY_SRC (handler);
@@ -789,11 +798,20 @@ gst_spotify_src_uri_get_uri (GstURIHandler * handler)
 }
 
 static gboolean
-gst_spotify_src_uri_set_uri (GstURIHandler * handler, const gchar * uri)
+gst_spotify_src_uri_set_uri (GstURIHandler * handler, const gchar * uri, GError ** error)
 {
+  gboolean res = TRUE;
   GstSpotifySrc *spotifysrc = GST_SPOTIFY_SRC (handler);
+
   GST_DEBUG_OBJECT (spotifysrc, "New URI for interface: '%s' for spotify src", uri);
-  return gst_spotify_src_set_uri (spotifysrc, uri);
+  if (!gst_spotify_src_set_uri (spotifysrc, uri)) {
+    *error = g_error_new (
+      g_quark_from_string("gst-resource-error-quark"),
+      GST_RESOURCE_ERROR_FAILED,
+      "Failed to set source URI: '%s'", uri);
+      res = FALSE;
+  }
+  return res;
 }
 
 static void
