@@ -1,6 +1,7 @@
-/* GStreamer
+/*
  * Copyright (C) 2007 David Schleef <ds@schleef.org>
  *           (C) 2008 Wim Taymans <wim.taymans@gmail.com>
+ *           (C) 2015 Canonical <michal.karnicki@canonical.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -17,18 +18,13 @@
  * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
  * Boston, MA 02111-1307, USA.
  */
-/**
- * SECTION:gstspotifysrc
- * @short_description: Easy way for applications to inject spotify music
- *   into a pipeline
- * @see_also: #GstBaseSrc
- */
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
 
 #include <gst/gst.h>
+#include <gst/audio/audio.h>
 #include <gst/base/gstbasesrc.h>
 #include <libspotify/api.h>
 
@@ -40,9 +36,9 @@
 
 typedef struct _GstSpotifySessionContext
 {
-  GCond          *cond;
+  GCond          cond;
   GThread        *thread;
-  GMutex         *mutex;
+  GMutex         mutex;
   sp_session     *session;
   gboolean       destroy;
   gboolean       logged_in;
@@ -55,8 +51,8 @@ typedef struct _GstSpotifySessionContext
 
 struct _GstSpotifySrcPrivate
 {
-  GCond        *cond;
-  GMutex       *mutex;
+  GCond        cond;
+  GMutex       mutex;
   GQueue       *queue;
 
   GstCaps   *caps;
@@ -100,7 +96,8 @@ enum
   PROP_LAST
 };
 
-/* Spotify library does not provide user data with callbacks, so we
+/*
+ * Spotify library does not provide user data with callbacks, so we
  * have to store our context globally.
  */
 static GstSpotifySrc *g_spotifysrc = NULL;
@@ -109,12 +106,15 @@ static GstStaticPadTemplate gst_spotify_src_template =
 GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("audio/x-raw-int, "
+    GST_STATIC_CAPS ("audio/x-raw, "
+            // This line will most probably break source hilighting :/
+            "format = (string) " GST_AUDIO_NE(S16) ", "
             "endianness = (int) { 1234 }, "
             "signed = (boolean) { TRUE }, "
             "width = (int) 16, "
             "depth = (int) 16, "
-            "rate = (int) 44100, channels = (int) 2; ")
+            "rate = (int) 44100, "
+            "channels = (int) 2")
     );
 
 static void gst_spotify_src_uri_handler_init (gpointer g_iface,
@@ -136,7 +136,6 @@ static gboolean gst_spotify_src_unlock (GstBaseSrc * bsrc);
 static gboolean gst_spotify_src_unlock_stop (GstBaseSrc * bsrc);
 static gboolean gst_spotify_src_do_seek (GstBaseSrc * src, GstSegment * segment);
 static gboolean gst_spotify_src_is_seekable (GstBaseSrc * src);
-static gboolean gst_spotify_src_check_get_range (GstBaseSrc * src);
 static gboolean gst_spotify_src_do_get_size (GstBaseSrc * src, guint64 * size);
 static gboolean gst_spotify_src_query (GstBaseSrc * src, GstQuery * query);
 static gboolean
@@ -155,41 +154,16 @@ static gboolean spotify_seek(GstSpotifySessionContext *context, int offset);
 static gboolean spotify_play(GstSpotifySessionContext *context, const char *link);
 static gboolean spotify_stop(GstSpotifySessionContext *context);
 
-static void
-_do_init (GType filesrc_type)
-{
-  static const GInterfaceInfo urihandler_info = {
-    gst_spotify_src_uri_handler_init,
-    NULL,
-    NULL
-  };
-  g_type_add_interface_static (filesrc_type, GST_TYPE_URI_HANDLER,
-      &urihandler_info);
-}
-
-GST_BOILERPLATE_FULL (GstSpotifySrc, gst_spotify_src, GstBaseSrc, GST_TYPE_BASE_SRC,
-    _do_init);
-
-static void
-gst_spotify_src_base_init (gpointer g_class)
-{
-  GstElementClass *element_class = GST_ELEMENT_CLASS (g_class);
-
-  GST_DEBUG_CATEGORY_INIT (spotify_src_debug, "spotify", 0, "spotifysrc element");
-
-  gst_element_class_set_details_simple (element_class, "SpotifySrc",
-      "Generic/Source", "Feed spotify hosted music to a pipeline",
-      "Liam Wickins <liamw9534@gmail.com");
-
-  gst_element_class_add_pad_template (element_class,
-      gst_static_pad_template_get (&gst_spotify_src_template));
-}
+#define parent_class gst_spotify_src_parent_class
+G_DEFINE_TYPE_EXTENDED (GstSpotifySrc, gst_spotify_src, GST_TYPE_BASE_SRC, 0,
+    G_IMPLEMENT_INTERFACE(GST_TYPE_URI_HANDLER, gst_spotify_src_uri_handler_init));
 
 static void
 gst_spotify_src_class_init (GstSpotifySrcClass * klass)
 {
   GObjectClass *gobject_class = (GObjectClass *) klass;
   GstBaseSrcClass *basesrc_class = (GstBaseSrcClass *) klass;
+  GstElementClass *element_class = (GstElementClass *) klass;
 
   gobject_class->dispose = gst_spotify_src_dispose;
   gobject_class->finalize = gst_spotify_src_finalize;
@@ -198,20 +172,20 @@ gst_spotify_src_class_init (GstSpotifySrcClass * klass)
   gobject_class->get_property = gst_spotify_src_get_property;
 
   g_object_class_install_property (gobject_class, PROP_USER,
-      g_param_spec_string ("user", "Username", "Username for premium spotify account",
+      g_param_spec_string ("user", "Username", "Username for premium Spotify account",
           DEFAULT_PROP_USER, G_PARAM_READWRITE));
 
   g_object_class_install_property (gobject_class, PROP_PASS,
-      g_param_spec_string ("pass", "Password", "Password for premium spotify account",
-	  DEFAULT_PROP_PASS, G_PARAM_READWRITE));
+      g_param_spec_string ("pass", "Password", "Password for premium Spotify account",
+	      DEFAULT_PROP_PASS, G_PARAM_READWRITE));
 
   g_object_class_install_property (gobject_class, PROP_URI,
-      g_param_spec_string ("uri", "URI", "A URI", DEFAULT_PROP_URI,
-          G_PARAM_READWRITE));
+      g_param_spec_string ("uri", "URI", "A Spotify track URI",
+          DEFAULT_PROP_URI, G_PARAM_READWRITE));
 
   g_object_class_install_property (gobject_class, PROP_APPKEY_FILE,
       g_param_spec_string ("spotifykeyfile", "Spotify app key File", "Path to spotify key file",
-        DEFAULT_PROP_APPKEY_FILE, G_PARAM_READWRITE));
+          DEFAULT_PROP_APPKEY_FILE, G_PARAM_READWRITE));
 
   basesrc_class->create = gst_spotify_src_create;
   basesrc_class->start = gst_spotify_src_start;
@@ -220,23 +194,32 @@ gst_spotify_src_class_init (GstSpotifySrcClass * klass)
   basesrc_class->unlock_stop = gst_spotify_src_unlock_stop;
   basesrc_class->do_seek = gst_spotify_src_do_seek;
   basesrc_class->is_seekable = gst_spotify_src_is_seekable;
-  basesrc_class->check_get_range = gst_spotify_src_check_get_range;
   basesrc_class->get_size = gst_spotify_src_do_get_size;
   basesrc_class->query = gst_spotify_src_query;
+
+  gst_element_class_add_pad_template (element_class,
+    gst_static_pad_template_get (&gst_spotify_src_template));
+
+  gst_element_class_set_metadata (
+    element_class,
+    "Spotify audio source",
+    "Source/Audio/Network/Protocol",
+    "Feed Spotify hosted music to a pipeline",
+    "Liam Wickins <liam9534@gmail.com>");
+
+  GST_DEBUG_CATEGORY_INIT (spotify_src_debug, "spotify", 0, "spotifysrc element");
 
   g_type_class_add_private (klass, sizeof (GstSpotifySrcPrivate));
 }
 
 static void
-gst_spotify_src_init (GstSpotifySrc * spotifysrc, GstSpotifySrcClass * klass)
+gst_spotify_src_init (GstSpotifySrc * spotifysrc)
 {
   GstSpotifySrcPrivate *priv;
 
-  priv = spotifysrc->priv = G_TYPE_INSTANCE_GET_PRIVATE (spotifysrc, GST_TYPE_SPOTIFY_SRC,
-      GstSpotifySrcPrivate);
+  priv = spotifysrc->priv = G_TYPE_INSTANCE_GET_PRIVATE (
+        spotifysrc, GST_TYPE_SPOTIFY_SRC, GstSpotifySrcPrivate);
 
-  priv->mutex = g_mutex_new ();
-  priv->cond = g_cond_new ();
   priv->queue = g_queue_new ();
 
   priv->max_bytes = DEFAULT_PROP_MAX_BYTES;
@@ -287,12 +270,10 @@ gst_spotify_src_finalize (GObject * obj)
   GstSpotifySrcPrivate *priv = spotifysrc->priv;
 
   spotify_destroy(priv->spotify_context);
-  g_free (priv->uri);
-  g_free (priv->appkey_file);
   g_free (priv->user);
   g_free (priv->pass);
-  g_mutex_free (priv->mutex);
-  g_cond_free (priv->cond);
+  g_free (priv->appkey_file);
+  g_free (priv->uri);
   g_queue_free (priv->queue);
 
   G_OBJECT_CLASS (parent_class)->finalize (obj);
@@ -359,11 +340,11 @@ gst_spotify_src_unlock (GstBaseSrc * bsrc)
   GstSpotifySrc *spotifysrc = GST_SPOTIFY_SRC_CAST (bsrc);
   GstSpotifySrcPrivate *priv = spotifysrc->priv;
 
-  g_mutex_lock (priv->mutex);
+  g_mutex_lock(&priv->mutex);
   GST_DEBUG_OBJECT (spotifysrc, "unlock start");
   priv->flushing = TRUE;
-  g_cond_broadcast (priv->cond);
-  g_mutex_unlock (priv->mutex);
+  g_cond_broadcast(&priv->cond);
+  g_mutex_unlock(&priv->mutex);
 
   return TRUE;
 }
@@ -374,11 +355,11 @@ gst_spotify_src_unlock_stop (GstBaseSrc * bsrc)
   GstSpotifySrc *spotifysrc = GST_SPOTIFY_SRC_CAST (bsrc);
   GstSpotifySrcPrivate *priv = spotifysrc->priv;
 
-  g_mutex_lock (priv->mutex);
+  g_mutex_lock(&priv->mutex);
   GST_DEBUG_OBJECT (spotifysrc, "unlock stop");
   priv->flushing = FALSE;
-  g_cond_broadcast (priv->cond);
-  g_mutex_unlock (priv->mutex);
+  g_cond_broadcast(&priv->cond);
+  g_mutex_unlock(&priv->mutex);
 
   return TRUE;
 }
@@ -388,25 +369,30 @@ gst_spotify_src_start (GstBaseSrc * bsrc)
 {
   GstSpotifySrc *spotifysrc = GST_SPOTIFY_SRC_CAST (bsrc);
   GstSpotifySrcPrivate *priv = spotifysrc->priv;
+  gboolean has_created, has_logged_in, has_started;
 
-  g_mutex_lock (priv->mutex);
+  g_mutex_lock(&priv->mutex);
   GST_DEBUG_OBJECT (spotifysrc, "starting");
   priv->is_first_seek = TRUE;
   priv->flushing = FALSE;
   priv->stutter = 0;
   priv->buffer_timestamp = 0;
 
-  /* Create session */
-  if (!spotify_create(priv->appkey_file) ||
-      !spotify_login(priv->spotify_context, priv->user, priv->pass) ||
-      !spotify_play(priv->spotify_context, gst_uri_get_location(priv->uri)))
+  has_created = has_logged_in = has_started = FALSE;
+  if (!(has_created = spotify_create(priv->appkey_file)) ||
+      !(has_logged_in = spotify_login(priv->spotify_context, priv->user, priv->pass)) ||
+      !(has_started = spotify_play(priv->spotify_context, gst_uri_get_location(priv->uri))))
   {
-    g_mutex_unlock (priv->mutex);
+    if (!has_created) GST_DEBUG_OBJECT(spotifysrc, "Could not instantiate Spotify");
+    if (!has_logged_in) GST_DEBUG_OBJECT(spotifysrc, "Could not log in to Spotify");
+    if (!has_started) GST_DEBUG_OBJECT(spotifysrc, "Could not play track URI");
+
+    g_mutex_unlock(&priv->mutex);
     return FALSE;
   }
 
   priv->started = TRUE;
-  g_mutex_unlock (priv->mutex);
+  g_mutex_unlock(&priv->mutex);
 
   gst_base_src_set_format (bsrc, GST_FORMAT_TIME);
 
@@ -419,7 +405,7 @@ gst_spotify_src_stop (GstBaseSrc * bsrc)
   GstSpotifySrc *spotifysrc = GST_SPOTIFY_SRC_CAST (bsrc);
   GstSpotifySrcPrivate *priv = spotifysrc->priv;
 
-  g_mutex_lock (priv->mutex);
+  g_mutex_lock(&priv->mutex);
   GST_DEBUG_OBJECT (spotifysrc, "stopping");
   priv->is_eos = FALSE;
   priv->flushing = TRUE;
@@ -429,7 +415,7 @@ gst_spotify_src_stop (GstBaseSrc * bsrc)
   spotify_destroy(priv->spotify_context);
 
   priv->started = FALSE;
-  g_mutex_unlock (priv->mutex);
+  g_mutex_unlock(&priv->mutex);
 
   return TRUE;
 }
@@ -438,12 +424,6 @@ static gboolean
 gst_spotify_src_is_seekable (GstBaseSrc * src)
 {
   return TRUE;
-}
-
-static gboolean
-gst_spotify_src_check_get_range (GstBaseSrc * src)
-{
-  return FALSE;
 }
 
 static gboolean
@@ -477,6 +457,22 @@ gst_spotify_src_query (GstBaseSrc * src, GstQuery * query)
       gst_query_set_latency (query, live, min, max);
       break;
     }
+    case GST_QUERY_SCHEDULING:
+    {
+      gst_query_add_scheduling_mode (query, GST_PAD_MODE_PUSH);
+      res = TRUE;
+      break;
+    }
+    case GST_QUERY_CAPS:
+    {
+      GstCaps *caps;
+
+      caps = gst_static_pad_template_get_caps (&gst_spotify_src_template);
+      gst_query_set_caps_result (query, caps);
+      gst_caps_unref (caps);
+      res = TRUE;
+      break;
+    }
     default:
       res = GST_BASE_SRC_CLASS (parent_class)->query (src, query);
       break;
@@ -494,7 +490,7 @@ gst_spotify_src_do_seek (GstBaseSrc * src, GstSegment * segment)
   gint64 desired_position;
   gboolean res = FALSE;
 
-  desired_position = segment->last_stop;
+  desired_position = segment->position;
 
   /* This is to workaround a bug in spotify since we can't allow
    * an initial seek to position zero until the decoder has sent
@@ -519,15 +515,15 @@ gst_spotify_src_do_seek (GstBaseSrc * src, GstSegment * segment)
   res = spotify_seek(priv->spotify_context, (desired_position / GST_MSECOND));
 
   if (res) {
-    g_mutex_lock (priv->mutex);
+    g_mutex_lock(&priv->mutex);
     GST_DEBUG_OBJECT (spotifysrc, "flushing queue");
     gst_spotify_src_flush_queued (spotifysrc);
     priv->is_eos = FALSE;
     priv->buffer_timestamp = desired_position;
     GST_DEBUG_OBJECT (spotifysrc, "Waiting for seek to arrive...");
-    g_cond_wait (priv->cond, priv->mutex);
+    g_cond_wait(&priv->cond, &priv->mutex);
     GST_DEBUG_OBJECT (spotifysrc, "Seek has arrived...");
-    g_mutex_unlock (priv->mutex);
+    g_mutex_unlock(&priv->mutex);
   } else {
     GST_WARNING_OBJECT (spotifysrc, "seek failed");
   }
@@ -551,17 +547,16 @@ gst_spotify_src_create (GstBaseSrc * bsrc, guint64 offset, guint size,
     GST_DEBUG_OBJECT (spotifysrc,
         "Size changed from %" G_GINT64_FORMAT " to %" G_GINT64_FORMAT,
         bsrc->segment.duration, priv->size);
-    gst_segment_set_duration (&bsrc->segment, GST_FORMAT_TIME, priv->size);
+    bsrc->segment.duration = priv->size;
     GST_OBJECT_UNLOCK (spotifysrc);
 
     gst_element_post_message (GST_ELEMENT (spotifysrc),
-        gst_message_new_duration (GST_OBJECT (spotifysrc), GST_FORMAT_TIME,
-            priv->size));
+        gst_message_new_duration_changed (GST_OBJECT (spotifysrc)));
   } else {
     GST_OBJECT_UNLOCK (spotifysrc);
   }
 
-  g_mutex_lock (priv->mutex);
+  g_mutex_lock(&priv->mutex);
   /* check flushing first */
   if (G_UNLIKELY (priv->flushing))
     goto flushing;
@@ -572,16 +567,11 @@ gst_spotify_src_create (GstBaseSrc * bsrc, guint64 offset, guint size,
       guint buf_size;
 
       *buf = g_queue_pop_head (priv->queue);
-      buf_size = GST_BUFFER_SIZE (*buf);
+      buf_size = gst_buffer_get_size (*buf);
 
       GST_DEBUG_OBJECT (spotifysrc, "we have buffer %p of size %u", *buf, buf_size);
 
       priv->queued_bytes -= buf_size;
-
-      if (caps) {
-        *buf = gst_buffer_make_metadata_writable (*buf);
-        gst_buffer_set_caps (*buf, caps);
-      }
 
       ret = GST_FLOW_OK;
       break;
@@ -609,10 +599,10 @@ gst_spotify_src_create (GstBaseSrc * bsrc, guint64 offset, guint size,
     /* nothing to return, wait a while for new data or flushing. */
     GST_DEBUG_OBJECT (spotifysrc, "Waiting for data...");
     priv->stutter++;
-    g_cond_wait (priv->cond, priv->mutex);
+    g_cond_wait(&priv->cond, &priv->mutex);
   }
 
-  g_mutex_unlock (priv->mutex);
+  g_mutex_unlock(&priv->mutex);
   if (caps)
     gst_caps_unref (caps);
   return ret;
@@ -621,18 +611,18 @@ gst_spotify_src_create (GstBaseSrc * bsrc, guint64 offset, guint size,
 flushing:
   {
     GST_DEBUG_OBJECT (spotifysrc, "we are flushing");
-    g_mutex_unlock (priv->mutex);
+    g_mutex_unlock(&priv->mutex);
     if (caps)
       gst_caps_unref (caps);
-    return GST_FLOW_WRONG_STATE;
+    return GST_FLOW_FLUSHING;
   }
 eos:
   {
     GST_DEBUG_OBJECT (spotifysrc, "we are EOS");
-    g_mutex_unlock (priv->mutex);
+    g_mutex_unlock(&priv->mutex);
     if (caps)
       gst_caps_unref (caps);
-    return GST_FLOW_UNEXPECTED;
+    return GST_FLOW_EOS;
   }
 }
 
@@ -645,7 +635,7 @@ static guint gst_spotify_src_alloc_and_queue(GstSpotifySrc * spotifysrc,
 
   priv = spotifysrc->priv;
 
-  g_mutex_lock (priv->mutex);
+  g_mutex_lock(&priv->mutex);
 
   /* can't accept buffers when we are flushing or EOS */
   if (priv->flushing)
@@ -658,20 +648,24 @@ static guint gst_spotify_src_alloc_and_queue(GstSpotifySrc * spotifysrc,
     GST_DEBUG_OBJECT (spotifysrc,
         "queue filled (%" G_GUINT64_FORMAT " >= %" G_GUINT64_FORMAT ")",
         priv->queued_bytes, priv->max_bytes);
-    g_mutex_unlock (priv->mutex);
+    g_mutex_unlock(&priv->mutex);
     return 0;
   }
 
   /* Allocate buffer and copy spotify data into buffer */
-  GstBuffer *buffer = gst_buffer_new_and_alloc (data_size);
+  GstBuffer *buffer = gst_buffer_new_allocate (NULL, data_size, NULL);
   if (!buffer)
   {
       GST_DEBUG_OBJECT (spotifysrc, "gst_buffer allocation failed");
-      g_mutex_unlock (priv->mutex);
+      g_mutex_unlock(&priv->mutex);
       return 0;
   }
 
-  memcpy (GST_BUFFER_DATA (buffer), (guint8 *)data_frames, data_size);
+  GstMapInfo info;
+  gst_buffer_map(buffer, &info, GST_MAP_WRITE);
+  memcpy (info.data, (guint8 *)data_frames, info.size);
+  gst_buffer_unmap(buffer, &info);
+
   GstClockTime duration = gst_util_uint64_scale(num_frames, GST_SECOND, 44100);
   GST_BUFFER_DURATION(buffer) = duration;
   GST_BUFFER_TIMESTAMP(buffer) = priv->buffer_timestamp;
@@ -679,13 +673,13 @@ static guint gst_spotify_src_alloc_and_queue(GstSpotifySrc * spotifysrc,
   GST_DEBUG_OBJECT (spotifysrc, "queueing buffer %p", buffer);
   gst_buffer_ref (buffer);
   g_queue_push_tail (priv->queue, buffer);
-  priv->queued_bytes += GST_BUFFER_SIZE (buffer);
+  priv->queued_bytes += gst_buffer_get_size (buffer);
   GST_DEBUG_OBJECT (spotifysrc,
                     "queued bytes = %" G_GUINT64_FORMAT " ts = %" G_GUINT64_FORMAT,
                     priv->queued_bytes, priv->buffer_timestamp);
   priv->buffer_timestamp += duration;
-  g_cond_broadcast (priv->cond);
-  g_mutex_unlock (priv->mutex);
+  g_cond_broadcast(&priv->cond);
+  g_mutex_unlock(&priv->mutex);
 
   return num_frames;
 
@@ -693,13 +687,13 @@ static guint gst_spotify_src_alloc_and_queue(GstSpotifySrc * spotifysrc,
 flushing:
   {
     GST_DEBUG_OBJECT (spotifysrc, "refuse music data, we are flushing");
-    g_mutex_unlock (priv->mutex);
+    g_mutex_unlock(&priv->mutex);
     return num_frames;
   }
 eos:
   {
     GST_DEBUG_OBJECT (spotifysrc, "refuse music data, we are EOS");
-    g_mutex_unlock (priv->mutex);
+    g_mutex_unlock(&priv->mutex);
     return num_frames;
   }
 }
@@ -710,7 +704,7 @@ static void gst_spotify_src_end_of_stream (GstSpotifySrc * spotifysrc)
 
   priv = spotifysrc->priv;
 
-  g_mutex_lock (priv->mutex);
+  g_mutex_lock(&priv->mutex);
   /* can't accept buffers when we are flushing. We can accept them when we are
    * EOS although it will not do anything. */
   if (priv->flushing)
@@ -718,15 +712,15 @@ static void gst_spotify_src_end_of_stream (GstSpotifySrc * spotifysrc)
 
   GST_DEBUG_OBJECT (spotifysrc, "sending EOS");
   priv->is_eos = TRUE;
-  g_cond_broadcast (priv->cond);
-  g_mutex_unlock (priv->mutex);
+  g_cond_broadcast(&priv->cond);
+  g_mutex_unlock(&priv->mutex);
 
   return;
 
   /* ERRORS */
 flushing:
   {
-    g_mutex_unlock (priv->mutex);
+    g_mutex_unlock(&priv->mutex);
     GST_DEBUG_OBJECT (spotifysrc, "refuse EOS, we are flushing");
   }
 }
@@ -770,7 +764,6 @@ gst_spotify_src_set_uri (GstSpotifySrc *spotifysrc, const gchar *uri)
   spotifysrc->priv->uri = g_strdup(uri);
 
   g_object_notify (G_OBJECT (spotifysrc), "uri");
-  gst_uri_handler_new_uri (GST_URI_HANDLER (spotifysrc), spotifysrc->priv->uri);
 
   return TRUE;
 
@@ -784,20 +777,20 @@ wrong_location:
 }
 
 static GstURIType
-gst_spotify_src_uri_get_type (void)
+gst_spotify_src_uri_get_type (GType type)
 {
   return GST_URI_SRC;
 }
 
-static gchar **
-gst_spotify_src_uri_get_protocols (void)
+static const gchar * const *
+gst_spotify_src_uri_get_protocols (GType type)
 {
-  static gchar *protocols[] = { (char *) "spotify", NULL };
+  static const gchar * const protocols[] = { (const char *) "spotify", NULL };
 
   return protocols;
 }
 
-static const gchar *
+static gchar *
 gst_spotify_src_uri_get_uri (GstURIHandler * handler)
 {
   GstSpotifySrc *spotifysrc = GST_SPOTIFY_SRC (handler);
@@ -805,11 +798,20 @@ gst_spotify_src_uri_get_uri (GstURIHandler * handler)
 }
 
 static gboolean
-gst_spotify_src_uri_set_uri (GstURIHandler * handler, const gchar * uri)
+gst_spotify_src_uri_set_uri (GstURIHandler * handler, const gchar * uri, GError ** error)
 {
+  gboolean res = TRUE;
   GstSpotifySrc *spotifysrc = GST_SPOTIFY_SRC (handler);
+
   GST_DEBUG_OBJECT (spotifysrc, "New URI for interface: '%s' for spotify src", uri);
-  return gst_spotify_src_set_uri (spotifysrc, uri);
+  if (!gst_spotify_src_set_uri (spotifysrc, uri)) {
+    *error = g_error_new (
+      g_quark_from_string("gst-resource-error-quark"),
+      GST_RESOURCE_ERROR_FAILED,
+      "Failed to set source URI: '%s'", uri);
+      res = FALSE;
+  }
+  return res;
 }
 
 static void
@@ -829,9 +831,9 @@ gst_spotify_src_uri_handler_init (gpointer g_iface, gpointer iface_data)
 
 static void spotify_main_loop(GstSpotifySessionContext *context)
 {
-  g_mutex_lock(context->mutex);
+  g_mutex_lock(&context->mutex);
   while (!context->destroy) {
-    GTimeVal t;
+    gint64 end_time;
     int timeout;
 
     if (sp_session_process_events(context->session, &timeout) == SP_ERROR_OK) {
@@ -840,11 +842,10 @@ static void spotify_main_loop(GstSpotifySessionContext *context)
     	timeout = 1000;
     }
 
-    g_get_current_time(&t);
-    g_time_val_add(&t, (timeout * 1000));
-    g_cond_timed_wait(context->cond, context->mutex, &t);
+    end_time = g_get_monotonic_time () + 1 * G_TIME_SPAN_SECOND;
+    g_cond_wait_until(&context->cond, &context->mutex, end_time);
   }
-  g_mutex_unlock(context->mutex);
+  g_mutex_unlock(&context->mutex);
 }
 
 static void spotify_loop(void)
@@ -861,7 +862,7 @@ static gboolean spotify_login(GstSpotifySessionContext *context,
 {
   context->logged_in = FALSE;
   GST_DEBUG_OBJECT (g_spotifysrc, "attempting to login");
-  g_mutex_lock(context->mutex);
+  g_mutex_lock(&context->mutex);
   sp_error ret = sp_session_login(context->session, user, password,
                                   FALSE, NULL);
 
@@ -869,32 +870,32 @@ static gboolean spotify_login(GstSpotifySessionContext *context,
     guint cnt = 10;
     while (!context->logged_in && cnt-- > 0) {
       spotify_loop();
-      usleep(100000);
+      usleep(200000); // 200000 * 10 = 2 seconds
     }
 
     if (!context->logged_in)
       goto loginfailed;
-    g_mutex_unlock(context->mutex);
+    g_mutex_unlock(&context->mutex);
     return TRUE;
   }
 
 loginfailed:
   GST_DEBUG_OBJECT (g_spotifysrc, "unable to login - error = %d", ret);
-  g_mutex_unlock(context->mutex);
+  g_mutex_unlock(&context->mutex);
   return FALSE;
 }
 
 static gboolean spotify_seek(GstSpotifySessionContext *context, int offset)
 {
   GST_DEBUG_OBJECT (g_spotifysrc, "attempting to seek - offset = %d", offset);
-  g_mutex_lock(context->mutex);
+  g_mutex_lock(&context->mutex);
   sp_error ret = sp_session_player_seek(context->session, offset);
   if (ret != SP_ERROR_OK) {
     GST_DEBUG_OBJECT (g_spotifysrc, "unable to seek - error = %d", ret);
-    g_mutex_unlock(context->mutex);
+    g_mutex_unlock(&context->mutex);
     return FALSE;
   }
-  g_mutex_unlock(context->mutex);
+  g_mutex_unlock(&context->mutex);
   return TRUE;
 }
 
@@ -902,12 +903,12 @@ static gboolean spotify_play(GstSpotifySessionContext *context, const char *link
 {
   GST_DEBUG_OBJECT (g_spotifysrc, "attempting to load link = %s", link);
 
-  g_mutex_lock(context->mutex);
+  g_mutex_lock(&context->mutex);
   sp_link *spl = sp_link_create_from_string(link);
   if (!spl)
   {
     GST_DEBUG_OBJECT (g_spotifysrc, "could not create link for %s", link);
-    g_mutex_unlock(context->mutex);
+    g_mutex_unlock(&context->mutex);
     return FALSE;
   }
 
@@ -916,7 +917,7 @@ static gboolean spotify_play(GstSpotifySessionContext *context, const char *link
   {
     GST_DEBUG_OBJECT (g_spotifysrc, "could not find track for %s", link);
     sp_link_release(spl);
-    g_mutex_unlock(context->mutex);
+    g_mutex_unlock(&context->mutex);
     return FALSE;
   }
 
@@ -929,14 +930,14 @@ static gboolean spotify_play(GstSpotifySessionContext *context, const char *link
   guint cnt = 20;
   while (!sp_track_is_loaded(spt) && cnt-- > 0) {
     spotify_loop();
-    usleep(100000);
+    usleep(200000); // 200000 * 20 = 4 seconds
   }
 
   if (!sp_track_is_loaded(spt)) {
     GST_DEBUG_OBJECT (g_spotifysrc, "track loading timed out");
     sp_track_release(spt);
     sp_link_release(spl);
-    g_mutex_unlock(context->mutex);
+    g_mutex_unlock(&context->mutex);
     return FALSE;
   }
 
@@ -947,7 +948,7 @@ static gboolean spotify_play(GstSpotifySessionContext *context, const char *link
     GST_DEBUG_OBJECT (g_spotifysrc, "player could not load track - error = %d", ret);
     sp_track_release(spt);
     sp_link_release(spl);
-    g_mutex_unlock(context->mutex);
+    g_mutex_unlock(&context->mutex);
     return FALSE;
   }
 
@@ -959,36 +960,36 @@ static gboolean spotify_play(GstSpotifySessionContext *context, const char *link
     GST_DEBUG_OBJECT (g_spotifysrc, "player could not play - error = %d", ret);
     sp_track_release(spt);
     sp_link_release(spl);
-    g_mutex_unlock(context->mutex);
+    g_mutex_unlock(&context->mutex);
     return FALSE;
   }
 
-  g_mutex_unlock(context->mutex);
+  g_mutex_unlock(&context->mutex);
   return TRUE;
 }
 
 static gboolean spotify_stop(GstSpotifySessionContext *context)
 {
   GST_DEBUG_OBJECT (g_spotifysrc, "attempting to stop player");
-  g_mutex_lock(context->mutex);
+  g_mutex_lock(&context->mutex);
   sp_error ret = sp_session_player_play(context->session, FALSE);
   if (ret != SP_ERROR_OK) {
     GST_DEBUG_OBJECT (g_spotifysrc, "unable to stop player - error = %d", ret);
-    g_mutex_unlock(context->mutex);
+    g_mutex_unlock(&context->mutex);
     return FALSE;
   }
 
   ret = sp_session_player_unload(context->session);
   if (ret != SP_ERROR_OK) {
     GST_DEBUG_OBJECT (g_spotifysrc, "unable to unload player - error = %d", ret);
-    g_mutex_unlock(context->mutex);
+    g_mutex_unlock(&context->mutex);
     return FALSE;
   }
 
   /* Reset total track size */
   g_spotifysrc->priv->size = -1;
 
-  g_mutex_unlock(context->mutex);
+  g_mutex_unlock(&context->mutex);
   return TRUE;
 }
 
@@ -1000,6 +1001,9 @@ static void spotify_logged_in_cb(sp_session *session, sp_error error)
     context->logged_in = TRUE;
   else
     context->logged_in = FALSE;
+
+    // This is absolutely necessary here, see: http://goo.gl/78xPQh
+    sp_session_playlistcontainer(session);
 }
 
 static void spotify_logged_out_cb(sp_session *session)
@@ -1030,7 +1034,7 @@ static void spotify_notify_main_thread_cb(sp_session *session)
 {
   GstSpotifySessionContext *context = SPOTIFY_CONTEXT(g_spotifysrc);
   GST_DEBUG_OBJECT (g_spotifysrc, "notify main thread");
-  g_cond_signal(context->cond);
+  g_cond_signal(&context->cond);
 }
 
 static int spotify_music_delivery_cb(sp_session *session,
@@ -1144,8 +1148,6 @@ static gboolean spotify_create(char *appkey_file)
 	  return FALSE;
 
   memset(context, 0, sizeof(*context));
-  context->mutex = g_mutex_new ();
-  context->cond = g_cond_new ();
 
   memset(&config, 0, sizeof(config));
   config.application_key = appkey;
@@ -1165,11 +1167,9 @@ static gboolean spotify_create(char *appkey_file)
   sp_error ret = sp_session_create(&config, &context->session);
   if (ret == SP_ERROR_OK)
   {
-    GError *err;
-    context->thread = g_thread_create ((GThreadFunc)spotify_main_loop, context, TRUE, &err);
+    context->thread = g_thread_new ("spotify-thread", (GThreadFunc)spotify_main_loop, context);
     if (context->thread == NULL) {
-       GST_DEBUG_OBJECT (g_spotifysrc, "g_thread_create failed: %s!", err->message );
-       g_error_free (err);
+       GST_DEBUG_OBJECT (g_spotifysrc, "g_thread_create failed!");
        sp_session_release(context->session);
        goto fail;
     }
@@ -1181,8 +1181,6 @@ static gboolean spotify_create(char *appkey_file)
 
 fail:
   g_spotifysrc->priv->spotify_context = NULL;
-  g_mutex_free(context->mutex);
-  g_cond_free(context->cond);
   g_free(context);
   return FALSE;
 }
@@ -1196,14 +1194,12 @@ static gboolean spotify_destroy(GstSpotifySessionContext *context)
   }
 
   GST_DEBUG_OBJECT (g_spotifysrc, "now destroying spotify session");
-  g_mutex_lock(context->mutex);
+  g_mutex_lock(&context->mutex);
   context->destroy = TRUE;
-  g_cond_signal(context->cond);
-  g_mutex_unlock(context->mutex);
+  g_cond_signal(&context->cond);
+  g_mutex_unlock(&context->mutex);
   g_thread_join(context->thread);
   sp_error ret = sp_session_release(context->session);
-  g_mutex_free(context->mutex);
-  g_cond_free(context->cond);
   g_free(context);
   g_spotifysrc->priv->spotify_context = NULL;
   if (ret != SP_ERROR_OK) {

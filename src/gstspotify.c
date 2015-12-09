@@ -39,8 +39,9 @@ plugin_init (GstPlugin * plugin)
   return TRUE;
 }
 
-GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,
+GST_PLUGIN_DEFINE (
+    GST_VERSION_MAJOR,
     GST_VERSION_MINOR,
-    "spotify",
+    spotify,
     "Element used to provide audio music hosted by spotify",
     plugin_init, VERSION, "LGPL", "GStreamer", "http://gstreamer.net/")
